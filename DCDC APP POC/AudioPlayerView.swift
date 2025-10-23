@@ -1,6 +1,6 @@
 import SwiftUI
-
 import AVFoundation
+import Darwin
 
 
 
@@ -189,7 +189,7 @@ struct AudioPlayerView: View {
         return timeDiff > 0 ? positionDiff / timeDiff : 0
     }
     
-    // Seek functions
+    // Enhanced seek functions with precise timing
     private func seekToPosition(_ time: Double) {
         seekToPositionWithTimestamp(time, nil)
     }
@@ -198,116 +198,139 @@ struct AudioPlayerView: View {
         guard let player = syncService.audioPlayer, time >= 0, time <= syncService.duration else { return }
         
         let diff = abs(time - syncService.currentTime)
-        let isForward = time > syncService.currentTime
         
-        // Enhanced directional seek handling
-        if diff < 0.03 {  // Ultra-micro adjustment - direct set
-            player.currentTime = time
-            print("🎯 ULTRA-MICRO: Direct set to \(String(format: "%.3f", time))s")
-            return
+        // Add to seek history for directional smoothing
+        addSeekToHistory(time)
+        
+        // Apply smoothing for rapid directional seeks
+        let smoothedTarget = getSmoothedSeekTarget(time)
+        
+        // Enhanced seek with compensation for different scenarios
+        if diff > Constants.fallbackSyncThreshold {
+            // Large seek - immediate jump with predictive compensation
+            let compensatedTarget = smoothedTarget + (consecutiveDirectionalSeeks > 2 ? Constants.predictiveCompensation * Double(lastSeekDirection) : 0)
+            performEnhancedSeek(to: compensatedTarget, startTime: startTime)
+        } else if diff > Constants.syncThreshold {
+            // Medium seek - smooth transition
+            performSmoothSeek(to: smoothedTarget, startTime: startTime)
+        } else if diff > Constants.microSyncThreshold {
+            // Micro adjustment - gentle correction
+            microAdjustSync(targetTime: smoothedTarget)
         }
         
-        if diff < 0.08 {  // Micro adjustment with direction-aware smoothing
-            let wasPlaying = syncService.isPlaying
-            
-            // Directional fade for smoother transitions
-            if wasPlaying {
-                // Quick fade out
-                player.setVolume(0.3, fadeDuration: 0.02)
-            }
-            
-            player.currentTime = time
-            
-            if wasPlaying {
-                // Quick fade back in
-                player.setVolume(syncService.volume, fadeDuration: 0.03)
-            }
-            
-            print("🔧 DIRECTIONAL-MICRO: \(isForward ? "⏩" : "⏪") \(String(format: "%.0f", diff * 1000))ms")
-            return
-        }
+        // Update timing anchors
+        lastUpdateTime = Date()
+        lastKnownTheaterTime = time
+    }
+    
+    private func performEnhancedSeek(to time: Double, startTime: UInt64?) {
+        // Cancel any pending resume operations
+        resumeWorkItem?.cancel()
         
-        if diff < 0.25 {  // Small adjustment with predictive compensation
-            let wasPlaying = syncService.isPlaying
-            
-            if wasPlaying {
-                // Smooth volume fade
-                player.setVolume(0.1, fadeDuration: 0.05)
-                
-                // Predictive seek - compensate for processing delay
-                let compensatedTime = isForward ? time + 0.02 : time - 0.02
-                player.currentTime = max(0, min(syncService.duration, compensatedTime))
-                
-                // Quick fade back
-                player.setVolume(syncService.volume, fadeDuration: 0.08)
-            } else {
-                player.currentTime = time
-            }
-            
-            print("🚀 PREDICTIVE-SEEK: \(isForward ? "⏩" : "⏪") to \(String(format: "%.3f", time))s")
-            return
-        }
-        
-        // Large seek - minimize interruption with smart buffering
         let wasPlaying = syncService.isPlaying
         
+        // Pause for precise seeking
         if wasPlaying {
-            player.pause()
-            player.currentTime = time
-            
-            resumeWorkItem?.cancel()
-            
-            let workItem = DispatchWorkItem {
-                if self.syncService.isPlaying {
-                    self.syncService.audioPlayer?.play()
-                }
-            }
-            
-            resumeWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
-        } else {
-            player.currentTime = time
+            syncService.audioPlayer?.pause()
         }
         
-        print("⚡ FAST-SEEK: \(isForward ? "⏩" : "⏪") Large jump to \(String(format: "%.3f", time))s")
+        // Perform the seek with enhanced timing
+        syncService.seekToPosition(time)
         
-        // Record seek timing for AudioMatcher
-        if let startTime = startTime {
-            let completionTime = mach_absolute_time()
-            syncService.audioMatcher.recordPlayerSeekDelay(seekStartTime: startTime, seekCompletionTime: completionTime)
+        // Resume playback with timing compensation
+        if wasPlaying {
+            let resumeWork = DispatchWorkItem {
+                // Apply micro-compensation for seek latency
+                let currentPlayerTime = syncService.audioPlayer?.currentTime ?? 0
+                let expectedTime = time
+                let drift = abs(currentPlayerTime - expectedTime)
+                
+                if drift > 0.01 { // 10ms drift threshold
+                    syncService.audioPlayer?.currentTime = expectedTime
+                }
+                
+                syncService.audioPlayer?.play()
+            }
+            
+            resumeWorkItem = resumeWork
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: resumeWork) // 20ms delay for stability
+        }
+    }
+    
+    private func performSmoothSeek(to time: Double, startTime: UInt64?) {
+        // Smooth seeking for medium adjustments
+        let currentTime = syncService.currentTime
+        let steps = 3
+        let stepSize = (time - currentTime) / Double(steps)
+        
+        for i in 1...steps {
+            let delay = Double(i) * 0.01 // 10ms intervals
+            let targetTime = currentTime + (stepSize * Double(i))
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                syncService.audioPlayer?.currentTime = targetTime
+            }
         }
     }
     
     private func microAdjustSync(targetTime: Double) {
         guard let player = syncService.audioPlayer else { return }
         
-        let currentPos = player.currentTime
-        let difference = targetTime - currentPos
+        let diff = abs(targetTime - syncService.currentTime)
+        let isForward = targetTime > syncService.currentTime
         
-        if abs(difference) < Constants.microSyncThreshold {
+        if diff < 0.01 {  // Ultra-micro adjustment - direct set with frame precision
+            player.currentTime = targetTime
+            print("🎯 ULTRA-MICRO: Direct set to \(String(format: "%.3f", targetTime))s")
             return
         }
-
-        let wasPlaying = syncService.isPlaying
-        if wasPlaying {
-            player.pause()
-        }
-
-        player.currentTime = targetTime
-        print("🔧 MICRO-ADJUSTED: \(String(format: "%.0f", difference * 1000))ms correction")
-
-        if wasPlaying {
-            resumeWorkItem?.cancel()
+        
+        if diff < 0.05 {  // Micro adjustment with enhanced smoothing
+            let wasPlaying = syncService.isPlaying
             
-            let workItem = DispatchWorkItem {
-                if self.syncService.isPlaying {
-                    self.syncService.audioPlayer?.play()
-                }
+            // Enhanced directional compensation
+            if wasPlaying {
+                // Minimal volume fade for seamless transition
+                player.setVolume(0.7, fadeDuration: 0.01)
             }
             
-            resumeWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: workItem)
+            // Apply precise timing with compensation
+            let compensatedTime = targetTime + (isForward ? 0.005 : -0.005) // 5ms compensation
+            player.currentTime = max(0, min(syncService.duration, compensatedTime))
+            
+            if wasPlaying {
+                // Quick restore volume
+                player.setVolume(syncService.volume, fadeDuration: 0.02)
+            }
+            
+            print("🔧 ENHANCED-MICRO: \(isForward ? "⏩" : "⏪") \(String(format: "%.0f", diff * 1000))ms")
+            return
         }
+        
+        if diff < 0.15 {  // Small adjustment with predictive compensation
+            let wasPlaying = syncService.isPlaying
+            
+            if wasPlaying {
+                // Smooth volume fade for larger adjustments
+                player.setVolume(0.3, fadeDuration: 0.03)
+                
+                // Enhanced predictive seek with direction-aware compensation
+                let processingDelay = isForward ? 0.015 : -0.015 // 15ms processing compensation
+                let compensatedTime = targetTime + processingDelay
+                player.currentTime = max(0, min(syncService.duration, compensatedTime))
+                
+                // Restore volume smoothly
+                player.setVolume(syncService.volume, fadeDuration: 0.05)
+            } else {
+                player.currentTime = targetTime
+            }
+            
+            print("🚀 ENHANCED-PREDICTIVE: \(isForward ? "⏩" : "⏪") to \(String(format: "%.3f", targetTime))s")
+            return
+        }
+        
+        // Fallback for larger adjustments
+        performEnhancedSeek(to: targetTime, startTime: nil)
     }
     
     private func updateTheaterSync(theaterTime: Double) {
